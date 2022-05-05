@@ -1,0 +1,107 @@
+#! /bin/sh
+
+MQTT_SERVER=${MQTT_SERVER:-127.0.0.1}
+MQTT_TOPIC=${MQTT_TOPIC:-nmea/gps}
+LISTEN_PORT=${LISTEN_PORT:-8500}
+
+##############################################################################
+#
+convert_coord() {
+    ang=$1
+    dir=$2
+    first=${ang:0:2}
+    last=${ang:2}
+    if [ "$dir" = "E" ] || [ "$dir" = "W" ]; then
+	first=${ang:0:3}
+	last=${ang:3}
+    fi
+    ret=$(lua -e "print(${first}+${last}/60)")
+    if [ "$dir" = "W" ] || [ "$dir" = "S" ]; then
+	ret="-$(echo $ret)"
+    fi
+    echo "$ret"
+}
+
+##############################################################################
+#
+iso_date() {
+    date=$1
+    time=$2
+    echo "20${date:4:2}-${date:2:2}-${date:0:2}T${time:0:2}:${time:2:2}:${time:4:2}Z"
+}
+
+##############################################################################
+#
+client() {
+    time=""
+    date=""
+    speedk=""
+    while read line; do
+	nmea=$(echo $line | cut -d, -f1)
+	if [ "${nmea}" = "\$GPGGA" ]; then
+	    time=$(echo $line | cut -d, -f2)
+	    lat=$(echo $line | cut -d, -f3)
+	    latd=$(echo $line | cut -d, -f4)
+	    long=$(echo $line | cut -d, -f5)
+	    longd=$(echo $line | cut -d, -f6)
+	    nbsat=$(echo $line | cut -d, -f8)
+	    acc=$(echo $line | cut -d, -f9)
+	    ele=$(echo $line | cut -d, -f10)
+#	    eleunit=$(echo $line | cut -d, -f11)
+	elif [ "${nmea}" = "\$GPRMC" ]; then
+	    date=$(echo $line | cut -d, -f10)
+	elif [ "${nmea}" = "\$GPVTG" ]; then
+	    speedk=$(echo $line | cut -d, -f8)
+	else
+	    echo "not supported sentence: ${nmea}"
+	fi
+	if [ -n "${time}" ] && [ -n "${date}" ] && [ -n "${speedk}" ]; then
+	    payload="{ \"time\": \"$(iso_date $date $time)\", \"latitude\": $(convert_coord $lat $latd), \"longitude\": $(convert_coord $long $longd), \"elevation\": ${ele}, \"accuracy\": ${acc}, \"sat_count\": $(lua -e "print(${nbsat})"), \"speed\": ${speedk} }"
+	    time=""
+	    date=""
+	    speedk=""
+	    curl -d "${payload}" mqtt://${MQTT_SERVER}/${MQTT_TOPIC}
+	fi
+    done
+}
+
+##############################################################################
+#
+server () {
+    socat -u TCP-LISTEN:${LISTEN_PORT},reuseaddr,fork STDOUT
+}
+
+##############################################################################
+#
+list_descendants () {
+    local ch=$(pgrep -P "$1")
+    for p in $ch; do
+	list_descendants "$p"
+    done
+    [ -n "$ch" ] && echo "$ch"
+}
+
+the_end () {
+    kill $(list_descendants $$)
+}
+
+##############################################################################
+#
+main () {
+    pipe=$(mktemp -u)
+    mkfifo $pipe
+
+    server >$pipe&
+    server_pid=$!
+    
+    client <$pipe&
+    client_pid=$!
+
+    rm -f $pipe
+    trap the_end 0 2 3 15
+    echo "my pid=$$, waiting for server=$server_pid and client=$client_pid"
+    wait
+}
+
+##############################################################################
+main
